@@ -1,0 +1,280 @@
+---
+title: "Severe Weather Analysis"
+author: "Kevin Roche"
+date: "17/08/2021"
+output:
+  prettydoc::html_pretty:
+    theme: architect
+    highlight: github
+    fig_height: 8
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+# Synopsis
+
+Using data from the [U.S. National Oceanic and Atmospheric Administration (NOAA)](https://d396qusza40orc.cloudfront.net/repdata%2Fpeer2_doc%2Fpd01016005curr.pdf), the following data analysis determines which weather events have been the most harmful to the US population from an economic and health perspective. 
+
+# Setup
+
+```{r}
+## Load packages
+library(tidyverse)
+library(ggplot2)
+```
+
+# Data Processing
+
+First, we need to load the data into R.
+
+```{r}
+## Load data
+url <- "https://d396qusza40orc.cloudfront.net/repdata%2Fdata%2FStormData.csv.bz2"
+dir <- "/Users/kevinroche22/RData/SevereWeatherAnalysis"
+setwd(dir)
+download.file(url, "StormData.csv.bz2")
+stormData <- read.csv(bzfile("StormData.csv.bz2"), header = TRUE, sep = ",")
+```
+
+Let's take a look at what we're working with.
+
+```{r}
+## Check Data
+dim(stormData)
+head(stormData, 3)
+```
+So, the data contains just over 900k observations of 37 different variables. It looks like some of the variables have missing data. Let's see how many missing values each variable has.
+
+```{r}
+## View proportions
+stormData %>% summarise_each(funs(100*mean(is.na(.))))
+
+## View totals
+stormData %>% summarise_each(funs(sum(is.na(.))))
+```
+Interesting. The "COUNTYENDN" variable is missing entirely, while the "F" variable is ~93% missing. A very small proportion of the latitude variables are also missing. Given that I'm only interested in the variables that have economic and health consequences, these missing values won't be problematic.
+
+Now, let's take a subset of the data that only includes the variables that are of interest to me.
+
+```{r}
+## Select Variables
+stormData <- stormData %>% 
+        select("BGN_DATE", "EVTYPE", "FATALITIES", "INJURIES", "PROPDMG", "PROPDMGEXP", "CROPDMG", "CROPDMGEXP")
+```
+
+Some of these variables are related. The value for "PROPDMG" doesn't represent the amount of property damage alone, it represents the coefficient - so it needs to be multiplied by the corresponding value from "PROPDMGEXP". The same logic follows for "CROPDMG" and "CROPDMGEXP". 
+
+The code below creates two new variables, "PROPERTYDMGS" and "CROPDMGS" that multiply the values for PROPDMG and CROPDMG by their corresponding exponent. Observations that have missing exponent values or erroneous exponent values (a very small amount of the exponents are labeled "?", for example) are assigned a value of NA.
+
+The original "PROPDMG, "PROPDMGEXP", "CROPDMG", and "CROPDMPEXP" columns are then dropped.
+
+``` {r}
+## Property Damage
+stormData$PROPDMGEXP <- as.character(stormData$PROPDMGEXP)
+stormData <- stormData %>% 
+        mutate(PROPERTYDMGS = case_when(PROPDMGEXP == "K" ~ PROPDMG * 1000,
+                                        PROPDMGEXP == "M" ~ PROPDMG * 1000000,
+                                        PROPDMGEXP == "B" ~ PROPDMG * 1000000000))
+
+## Crop Damage
+stormData$CROPDMGEXP <- as.character(stormData$CROPDMGEXP)
+stormData <- stormData %>% 
+        mutate(CROPDMGS = case_when(CROPDMGEXP == "K" ~ CROPDMG * 1000,
+                                    CROPDMGEXP == "M" ~ CROPDMG * 1000000,
+                                    CROPDMGEXP == "B" ~ CROPDMG * 1000000000))
+
+## Drop old property damage and crop damage columns
+stormData <- stormData %>% 
+        select(-PROPDMG, -PROPDMGEXP, -CROPDMG, -CROPDMGEXP)
+
+## Format new columns as integers
+stormData$CROPDMGS <- as.integer(stormData$CROPDMGS)
+stormData$PROPERTYDMGS <- as.integer(stormData$PROPERTYDMGS)
+```
+
+The date variable, BGN_DATE, isn't formatted as a date. Let's fix that, and then extract the year from it. 
+
+```{r}
+## Format as date
+stormData$BGN_DATE <- as.Date(stormData$BGN_DATE, "%m/%d/%Y")
+
+## Create new variable, year
+stormData <- stormData %>% 
+        mutate(YEAR = str_extract(BGN_DATE, "^\\d{4}")) %>%
+        select(-BGN_DATE)
+
+## Format year variable
+stormData$YEAR <- lubridate::ymd(stormData$YEAR, truncated = 2L)
+```
+
+The NOAA [notes](https://d396qusza40orc.cloudfront.net/repdata%2Fpeer2_doc%2Fpd01016005curr.pdf) that prior to 1996, only four types of events were recorded - Hail, Wind, Thunderstorms, and Tornadoes. From 1996 onward, 48 event types are recorded. The data will be skewed towards the original four events if I use data from all time periods, so I'll need to subset the data from 1996 onward to allow for proper comparison between event types.
+
+```{r}
+## Filter on observations from 1996 onward
+stormData <- stormData %>% 
+        filter(YEAR >= "1996-01-01")
+```
+
+We only need events that resulted in either health or economic impacts, so we can filter out observations that don't fall into either of those categories.
+
+```{r}
+## Only keep events with health or economic impacts
+stormData <- stormData %>% 
+        filter(PROPERTYDMGS > 0 | CROPDMGS > 0 | FATALITIES > 0 | INJURIES > 0)
+```
+
+Let's check the cleanliness of the event type data.
+
+```{r}
+## Change case of all event types to upper
+stormData$EVTYPE <- toupper(stormData$EVTYPE)
+stormData %>% distinct(EVTYPE)
+```
+Oof. There are 186 observations, when the NOAA says there should only be 48. This means there are a lot of duplicates in there.
+
+Because I'm looking for the most harmful events - and, I suppose, to avoid large amounts of tedious work - I'm going to only clean observations that are in the 90th percentile as far as health and economic impacts go.
+
+```{r}
+## Change NA's to 0's
+stormData <- stormData %>% 
+        mutate(CROPDMGS = replace_na(CROPDMGS, 0))
+stormData <- stormData %>% 
+        mutate(PROPERTYDMGS = replace_na(PROPERTYDMGS, 0))
+
+## Create variables representing health and economic impacts
+stormData <- stormData %>% 
+        mutate(HEALTHIMPACT = INJURIES + FATALITIES, ECONIMPACT = PROPERTYDMGS + CROPDMGS)
+
+## View observations in 90th percentile of health impacts
+stormData %>% 
+        group_by(EVTYPE) %>% 
+        summarise(HEALTHIMPACT = sum(HEALTHIMPACT)) %>% 
+        arrange(desc(HEALTHIMPACT)) %>% 
+        filter(HEALTHIMPACT > quantile(HEALTHIMPACT, 0.9))
+
+## View observations in 90th percentile of economic impacts
+stormData %>% 
+        group_by(EVTYPE) %>% 
+        summarise(ECONIMPACT = sum(ECONIMPACT)) %>% 
+        arrange(desc(ECONIMPACT)) %>% 
+        filter(ECONIMPACT > quantile(ECONIMPACT, 0.9))
+
+## Clean 90th percentile observations
+stormData <- stormData %>% 
+        mutate_at("EVTYPE", str_replace, "TSTM WIND", "THUNDERSTORM WIND") %>% 
+        mutate_at("EVTYPE", str_replace, "RIP CURRENTS", "RIP CURRENT") %>% 
+        mutate_at("EVTYPE", str_replace, "FOG", "FREEZING FOG") %>% 
+        mutate_at("EVTYPE", str_replace, "WILD/FOREST FIRE", "WILDFIRE") %>%
+        mutate_at("EVTYPE", str_replace, "HURRICANE/TYPHOON", "HURRICANE (TYPHOON)") %>% 
+        mutate_at("EVTYPE", str_replace, "EXTREME COLD/WIND CHILL", "EXTREME COLD") %>% 
+        mutate_at("EVTYPE", str_replace, "HURRICANE$", "HURRICANE (TYPHOON)")
+```
+At this point, the data set is clean enough to conduct some analysis on.
+
+## Results
+
+Let's visualize which weather events had the biggest health impacts.
+
+```{r}
+## Events with the largest total health costs
+healthCosts <- stormData %>% 
+        group_by(EVTYPE) %>% 
+        summarise(HEALTHIMPACT = sum(HEALTHIMPACT)) %>% 
+        arrange(desc(HEALTHIMPACT)) %>%
+        top_n(10) %>% 
+        ggplot(aes(x = reorder(EVTYPE, HEALTHIMPACT), y = HEALTHIMPACT, color = EVTYPE)) +
+        geom_bar(stat="identity") + 
+        theme_bw() +
+        theme(legend.position="none") +
+        ggtitle("Health Costs (Injuries + Fatalities) by Event Type") +
+        labs(x = "Event Type", y = "Total Health Impacts") +
+        coord_flip()
+        
+## Events with the largest number of injuries
+injuries <- stormData %>% 
+        group_by(EVTYPE) %>% 
+        summarise(INJURIES = sum(INJURIES)) %>% 
+        arrange(desc(INJURIES)) %>%
+        top_n(10) %>% 
+        ggplot(aes(x = reorder(EVTYPE, INJURIES), y = INJURIES, color = EVTYPE)) +
+        geom_bar(stat="identity") + 
+        theme_bw() +
+        theme(legend.position="none") +
+        ggtitle("Injuries by Event Type") +
+        labs(x = "Event Type", y = "Total Injuries") +
+        coord_flip()
+
+## Events with the largest number of deaths
+deaths <- stormData %>% 
+        group_by(EVTYPE) %>% 
+        summarise(FATALITIES = sum(FATALITIES)) %>% 
+        arrange(desc(FATALITIES)) %>%
+        top_n(10) %>% 
+        ggplot(aes(x = reorder(EVTYPE, FATALITIES), y = FATALITIES, color = EVTYPE)) +
+        geom_bar(stat="identity") + 
+        theme_bw() +
+        theme(legend.position="none") +
+        ggtitle("Fatalities by Event Type") +
+        labs(x = "Event Type", y = "Total Deaths") +
+        coord_flip()
+
+## Plot
+gridExtra::grid.arrange(healthCosts, injuries, deaths, heights = unit(c(2.5,2.5,2.5), c("in", "in", "in")), nrow = 3)
+```
+
+We observe that tornadoes lead to the most injuries, while excessive heat causes the most fatalities. 
+
+Now, let's visualize which events had the biggest economic consequences.
+
+```{r}
+## Events with the largest total economic costs
+econData <- stormData %>% 
+        group_by(EVTYPE) %>% 
+        summarise(ECONIMPACT = sum(ECONIMPACT)) %>% 
+        arrange(desc(ECONIMPACT)) %>% 
+        top_n(10) %>% 
+        ggplot(aes(x = reorder(EVTYPE, ECONIMPACT), y = ECONIMPACT, color = EVTYPE)) +
+        geom_bar(stat="identity") + 
+        theme_bw() +
+        theme(legend.position="none") +
+        ggtitle("Economic Costs (Property + Crop Damage) by Event Type") +
+        labs(x = "Event Type", y = "Total Economic Costs") + 
+        coord_flip() +
+        scale_y_continuous(labels=scales::dollar_format())
+
+## Events with the largest total property damage
+propertyDamage <- stormData %>% 
+        group_by(EVTYPE) %>% 
+        summarise(PROPERTYDMGS = sum(PROPERTYDMGS)) %>% 
+        arrange(desc(PROPERTYDMGS)) %>% 
+        top_n(10) %>% 
+        ggplot(aes(x = reorder(EVTYPE, PROPERTYDMGS), y = PROPERTYDMGS, color = EVTYPE)) +
+        geom_bar(stat="identity") + 
+        theme_bw() +
+        theme(legend.position="none") +
+        ggtitle("Property Damage by Event Type") +
+        labs(x = "Event Type", y = "Total Property Damage") + 
+        coord_flip() +
+        scale_y_continuous(labels=scales::dollar_format())
+
+cropDamage <- stormData %>% 
+        group_by(EVTYPE) %>% 
+        summarise(CROPDMGS = sum(CROPDMGS)) %>% 
+        arrange(desc(CROPDMGS)) %>% 
+        top_n(10) %>% 
+        ggplot(aes(x = reorder(EVTYPE, CROPDMGS), y = CROPDMGS, color = EVTYPE)) +
+        geom_bar(stat="identity") + 
+        theme_bw() +
+        theme(legend.position="none") +
+        ggtitle("Crop Damage by Event Type") +
+        labs(x = "Event Type", y = "Total Crop Damage") + 
+        coord_flip() +
+        scale_y_continuous(labels=scales::dollar_format())
+
+## Plot
+gridExtra::grid.arrange(econData, propertyDamage, cropDamage, heights = unit(c(2.5,2.5,2.5), c("in", "in", "in")), nrow = 3)
+```
+
+We observe that floods cause the most property damage, while droughts cause the most crop damage. This makes intuitive sense - floods are somewhat common in homes, and crops often die in a drought.
